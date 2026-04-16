@@ -632,6 +632,20 @@ function isAddPhonePageReady() {
   return ADD_PHONE_PAGE_PATTERN.test(getPageTextSnapshot());
 }
 
+function isStep5ChatGPTLandingPageReady() {
+  const hostname = String(location.hostname || '').toLowerCase();
+  if (hostname !== 'chatgpt.com' && hostname !== 'www.chatgpt.com') {
+    return false;
+  }
+
+  const path = `${location.pathname || ''} ${location.href || ''}`;
+  if (/\/(?:auth|login|signup|add-phone)(?:[/?#]|$)/i.test(path)) {
+    return false;
+  }
+
+  return true;
+}
+
 function isStep8Ready() {
   const continueBtn = getPrimaryContinueButton();
   if (!continueBtn) return false;
@@ -733,6 +747,10 @@ async function waitForStep5SubmitOutcome(timeout = 15000) {
 
     if (isAddPhonePageReady()) {
       return { success: true, addPhonePage: true };
+    }
+
+    if (isStep5ChatGPTLandingPageReady()) {
+      return { success: true, chatgptPage: true };
     }
 
     if (isStep8Ready()) {

@@ -3993,6 +3993,30 @@ function getStep8CallbackUrlFromTabUpdate(tabId, changeInfo, tab, signupTabId) {
   return '';
 }
 
+function isStep5ChatGPTLandingPageUrl(rawUrl) {
+  const parsed = parseUrlSafely(rawUrl);
+  if (!parsed) return false;
+
+  const hostname = String(parsed.hostname || '').toLowerCase();
+  if (hostname !== 'chatgpt.com' && hostname !== 'www.chatgpt.com') {
+    return false;
+  }
+
+  if (/^\/(?:auth|login|signup|add-phone)(?:\/|$)/i.test(parsed.pathname || '')) {
+    return false;
+  }
+
+  return true;
+}
+
+function shouldRecoverStep5OnSignupTabUpdate(tabId, signupTabId, step5Status, rawUrl) {
+  return Number.isInteger(tabId)
+    && Number.isInteger(signupTabId)
+    && tabId === signupTabId
+    && step5Status === 'running'
+    && isStep5ChatGPTLandingPageUrl(rawUrl);
+}
+
 function getSourceLabel(source) {
   const labels = {
     'gmail-mail': 'Gmail 邮箱',
@@ -4010,6 +4034,67 @@ function getSourceLabel(source) {
     'cloudflare-temp-email': 'Cloudflare Temp Email',
   };
   return labels[source] || source || '未知来源';
+}
+
+async function maybeCompleteStep5FromSignupPageReady(message, sender) {
+  if (message?.source !== 'signup-page') {
+    return false;
+  }
+
+  const tabUrl = sender?.tab?.url || '';
+  if (!isStep5ChatGPTLandingPageUrl(tabUrl)) {
+    return false;
+  }
+
+  const state = await getState();
+  if (state?.stepStatuses?.[5] !== 'running') {
+    return false;
+  }
+
+  await addLog('步骤 5：检测到页面已跳转到 ChatGPT 首页，按注册成功处理。', 'ok');
+  await completeStepFromBackground(5, { chatgptPage: true });
+  return true;
+}
+
+const step5SignupRecoveryTabs = new Set();
+
+async function maybeRecoverStep5SignupPageOnTabUpdate(tabId, changeInfo, tab) {
+  const candidateUrl = changeInfo?.url || tab?.url || '';
+  if (!candidateUrl) {
+    return false;
+  }
+
+  const state = await getState();
+  const signupTabId = state?.tabRegistry?.['signup-page']?.tabId;
+  const step5Status = state?.stepStatuses?.[5];
+  if (!shouldRecoverStep5OnSignupTabUpdate(tabId, signupTabId, step5Status, candidateUrl)) {
+    return false;
+  }
+
+  if (step5SignupRecoveryTabs.has(tabId)) {
+    return false;
+  }
+
+  step5SignupRecoveryTabs.add(tabId);
+  try {
+    await addLog('步骤 5：检测到认证页已跳转到 ChatGPT 首页，正在重新连接内容脚本...', 'info');
+    await ensureContentScriptReadyOnTab('signup-page', tabId, {
+      inject: SIGNUP_PAGE_INJECT_FILES,
+      injectSource: 'signup-page',
+      timeoutMs: 20000,
+      retryDelayMs: 700,
+      logMessage: '步骤 5：ChatGPT 首页仍在加载，正在重试连接内容脚本...',
+    });
+
+    const refreshedTab = await chrome.tabs.get(tabId).catch(() => tab || null);
+    await maybeCompleteStep5FromSignupPageReady(
+      { source: 'signup-page' },
+      { tab: refreshedTab || tab || { url: candidateUrl } }
+    );
+    return true;
+  } finally {
+    step5SignupRecoveryTabs.delete(tabId);
+  }
 }
 
 // ============================================================
@@ -4736,6 +4821,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true; // async response
 });
 
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  maybeRecoverStep5SignupPageOnTabUpdate(tabId, changeInfo, tab).catch((error) => {
+    console.warn(
+      LOG_PREFIX,
+      `[maybeRecoverStep5SignupPageOnTabUpdate] tab=${tabId} failed: ${getErrorMessage(error)}`
+    );
+  });
+});
+
 async function handleMessage(message, sender) {
   switch (message.type) {
     case 'CONTENT_SCRIPT_READY': {
@@ -4743,6 +4837,7 @@ async function handleMessage(message, sender) {
       if (tabId && message.source) {
         await registerTab(message.source, tabId);
         flushCommand(message.source, tabId);
+        await maybeCompleteStep5FromSignupPageReady(message, sender);
         await addLog(`内容脚本已就绪：${getSourceLabel(message.source)}（标签页 ${tabId}）`);
       }
       return { ok: true };
@@ -5270,17 +5365,43 @@ async function executeStepViaCompletionSignal(step, timeoutMs = AUTO_RUN_SIGNAL_
     error => ({ ok: false, error }),
   );
 
-  let executeError = null;
-  try {
-    await executeStep(step, { deferRetryableTransportError: true });
-  } catch (err) {
-    executeError = err;
-    if (isStopError(err) || !isRetryableContentScriptTransportError(err)) {
-      notifyStepError(step, getErrorMessage(err));
+  const executeResultPromise = (async () => {
+    try {
+      await executeStep(step, { deferRetryableTransportError: true });
+      return { ok: true, error: null };
+    } catch (err) {
+      if (isStopError(err) || !isRetryableContentScriptTransportError(err)) {
+        notifyStepError(step, getErrorMessage(err));
+      }
+      return { ok: false, error: err };
     }
+  })();
+
+  const firstSettled = await Promise.race([
+    completionResultPromise.then(result => ({ source: 'completion', result })),
+    executeResultPromise.then(result => ({ source: 'execute', result })),
+  ]);
+
+  if (firstSettled.source === 'completion' && firstSettled.result.ok) {
+    executeResultPromise.then((executeResult) => {
+      if (!executeResult.ok && executeResult.error) {
+        console.warn(
+          LOG_PREFIX,
+          `[executeStepViaCompletionSignal] step ${step} completed before execute finished: ${getErrorMessage(executeResult.error)}`
+        );
+      }
+    }).catch(() => { });
+    return firstSettled.result.payload;
   }
 
-  const completionResult = await completionResultPromise;
+  const executeResult = firstSettled.source === 'execute'
+    ? firstSettled.result
+    : await executeResultPromise;
+  const executeError = executeResult.ok ? null : executeResult.error;
+  const completionResult = firstSettled.source === 'completion'
+    ? firstSettled.result
+    : await completionResultPromise;
+
   if (completionResult.ok) {
     if (executeError) {
       console.warn(
